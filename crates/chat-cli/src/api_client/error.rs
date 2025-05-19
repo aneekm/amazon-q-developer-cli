@@ -65,6 +65,12 @@ pub enum ApiClientError {
 
     #[error(transparent)]
     AuthError(#[from] AuthError),
+
+    #[error("alternate model configuration error: {0}")]
+    ModelConfigurationError(String),
+
+    #[error("alternate model runtime error: {0}")]
+    ModelRuntimeError(String),
 }
 
 #[cfg(test)]
@@ -121,6 +127,8 @@ mod tests {
                 raw_message(),
             )),
             ApiClientError::SmithyBuild(aws_smithy_types::error::operation::BuildError::other("<other>")),
+            ApiClientError::ModelConfigurationError("<model configuration error>".to_string()),
+            ApiClientError::ModelRuntimeError("<model runtime error>".to_string()),
         ]
     }
 

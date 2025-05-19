@@ -22,6 +22,7 @@ test = true
 doc = false
 
 [dependencies]
+gemini_streaming_client = { path = "../gemini_streaming_client" }
 amzn-codewhisperer-client = { path = "../amzn-codewhisperer-client" }
 amzn-codewhisperer-streaming-client = { path = "../amzn-codewhisperer-streaming-client" }
 amzn-consolas-client = { path = "../amzn-consolas-client" }

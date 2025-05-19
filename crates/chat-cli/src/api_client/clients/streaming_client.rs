@@ -6,6 +6,7 @@ use std::sync::{
 use amzn_codewhisperer_streaming_client::Client as CodewhispererStreamingClient;
 use amzn_qdeveloper_streaming_client::Client as QDeveloperStreamingClient;
 use aws_types::request_id::RequestId;
+use gemini_streaming_client::Client as GeminiStreamingClient;
 use tracing::{
     debug,
     error,
@@ -18,8 +19,13 @@ use super::shared::{
 };
 use crate::api_client::interceptor::opt_out::OptOutInterceptor;
 use crate::api_client::model::{
+    ChatMessage,
     ChatResponseStream,
     ConversationState,
+    FigDocument,
+    Tool,
+    ToolResultContentBlock,
+    ToolResultStatus,
 };
 use crate::api_client::{
     ApiClientError,
@@ -43,6 +49,7 @@ mod inner {
 
     use amzn_codewhisperer_streaming_client::Client as CodewhispererStreamingClient;
     use amzn_qdeveloper_streaming_client::Client as QDeveloperStreamingClient;
+    use gemini_streaming_client::Client as GeminiStreamingClient;
 
     use crate::api_client::model::ChatResponseStream;
 
@@ -50,6 +57,7 @@ mod inner {
     pub enum Inner {
         Codewhisperer(CodewhispererStreamingClient),
         QDeveloper(QDeveloperStreamingClient),
+        Gemini(GeminiStreamingClient),
         Mock(Arc<Mutex<std::vec::IntoIter<Vec<ChatResponseStream>>>>),
     }
 }
@@ -62,15 +70,23 @@ pub struct StreamingClient {
 
 impl StreamingClient {
     pub async fn new(database: &mut Database) -> Result<Self, ApiClientError> {
-        Ok(
-            if crate::util::system_info::in_cloudshell()
-                || std::env::var("Q_USE_SENDMESSAGE").is_ok_and(|v| !v.is_empty())
-            {
-                Self::new_qdeveloper_client(database, &Endpoint::load_q(database)).await?
-            } else {
-                Self::new_codewhisperer_client(database, &Endpoint::load_codewhisperer(database)).await?
-            },
-        )
+        let client = if gemini_streaming_client::config::config_exists()
+        {
+            println!(
+                "Gemini configuration found at {:?}",
+                gemini_streaming_client::config::get_config_path()
+            );
+
+            // debug!("Gemini connection test result: {}", GeminiStreamingClient::test_gemini().await);
+            Self::new_gemini_client().await?
+        } else if crate::util::system_info::in_cloudshell()
+            || std::env::var("Q_USE_SENDMESSAGE").is_ok_and(|v| !v.is_empty())
+        {
+            Self::new_qdeveloper_client(database, &Endpoint::load_q(database)).await?
+        } else {
+            Self::new_codewhisperer_client(database, &Endpoint::load_codewhisperer(database)).await?
+        };
+        Ok(client)
     }
 
     pub fn mock(events: Vec<Vec<ChatResponseStream>>) -> Self {
@@ -122,6 +138,28 @@ impl StreamingClient {
         let client = QDeveloperStreamingClient::from_conf(conf);
         Ok(Self {
             inner: inner::Inner::QDeveloper(client),
+            profile: None,
+        })
+    }
+
+    pub async fn new_gemini_client() -> Result<Self, ApiClientError> {
+        // Load Gemini configuration
+        let config = match gemini_streaming_client::config::load_config() {
+            Ok(config) => config,
+            Err(e) => {
+                error!("Failed to load Gemini configuration: {}", e);
+                return Err(ApiClientError::ModelConfigurationError(format!(
+                    "Failed to load Gemini configuration: {}",
+                    e
+                )));
+            },
+        };
+
+        // Create Gemini client
+        let client = GeminiStreamingClient::new(config);
+
+        Ok(Self {
+            inner: inner::Inner::Gemini(client),
             profile: None,
         })
     }
@@ -201,6 +239,203 @@ impl StreamingClient {
                         .await?,
                 ))
             },
+            inner::Inner::Gemini(client) => {
+                // Convert history to Gemini format
+                let gemini_history = history
+                    .map(|h| {
+                        h.iter()
+                            .map(|msg| {
+                                match msg {
+                                    ChatMessage::UserInputMessage(user_msg) => {
+                                        // Check if there are tool results in the user message context
+                                        let tool_results = user_msg
+                                            .user_input_message_context
+                                            .as_ref()
+                                            .and_then(|ctx| ctx.tool_results.as_ref())
+                                            .map(|results| {
+                                                results
+                                                    .iter()
+                                                    .map(|result| {
+                                                        // Convert the tool result content to a JSON value
+                                                        let content = result
+                                                            .content
+                                                            .iter()
+                                                            .map(|block| {
+                                                                match block {
+                                                                    ToolResultContentBlock::Text(text) => {
+                                                                        serde_json::Value::String(text.clone())
+                                                                    },
+                                                                    ToolResultContentBlock::Json(doc) => {
+                                                                        // Convert Document to a string representation
+                                                                        serde_json::Value::String(format!("{:?}", doc))
+                                                                    },
+                                                                }
+                                                            })
+                                                            .next()
+                                                            .unwrap_or(serde_json::Value::Null);
+
+                                                        gemini_streaming_client::conversion::MockToolResult {
+                                                            tool_use_id: result.tool_use_id.clone(),
+                                                            content,
+                                                            status: match result.status {
+                                                                ToolResultStatus::Success => "success".to_string(),
+                                                                ToolResultStatus::Error => "error".to_string(),
+                                                            },
+                                                        }
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            });
+
+                                        gemini_streaming_client::conversion::MockChatMessage::UserMessage {
+                                            content: user_msg.content.clone(),
+                                            tool_results,
+                                        }
+                                    },
+                                    ChatMessage::AssistantResponseMessage(assistant_msg) => {
+                                        // Convert tool uses if they exist
+                                        let tool_uses = assistant_msg.tool_uses.as_ref().map(|tool_uses| {
+                                            tool_uses
+                                                .iter()
+                                                .map(|tool_use| gemini_streaming_client::conversion::MockToolUse {
+                                                    name: tool_use.name.clone(),
+                                                    args: serde_json::to_value(&tool_use.input).unwrap_or_default(),
+                                                    tool_use_id: tool_use.tool_use_id.clone(),
+                                                })
+                                                .collect::<Vec<_>>()
+                                        });
+
+                                        gemini_streaming_client::conversion::MockChatMessage::AssistantMessage {
+                                            content: assistant_msg.content.clone(),
+                                            tool_uses,
+                                        }
+                                    },
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                // Convert tools to Gemini format
+                let tools =
+                    user_input_message.user_input_message_context.as_ref().and_then(|ctx| {
+                        ctx.tools.as_ref().map(|tools| {
+                            tools.iter().map(|tool| {
+                            match tool {
+                                Tool::ToolSpecification(spec) => {
+                                    gemini_streaming_client::conversion::MockTool {
+                                        name: spec.name.clone(),
+                                        description: spec.description.clone(),
+                                        parameters: match &spec.input_schema.json {
+                                            Some(json_doc) => {
+                                                // Convert the FigDocument to a serde_json::Value
+                                                let value = serde_json::to_value(json_doc).unwrap_or_default();
+                                                // Clean the parameters for Gemini API compatibility
+                                                gemini_streaming_client::conversion::clean_parameters_for_gemini(&value)
+                                            },
+                                            None => serde_json::json!({}),
+                                        },
+                                    }
+                                }
+                            }
+                        }).collect::<Vec<_>>()
+                        })
+                    });
+
+                // Convert user input message to MockChatMessage
+                let mock_user_message = gemini_streaming_client::conversion::MockChatMessage::UserMessage {
+                    content: user_input_message.content.clone(),
+                    tool_results: user_input_message
+                        .user_input_message_context
+                        .as_ref()
+                        .and_then(|ctx| ctx.tool_results.as_ref())
+                        .map(|results| {
+                            results
+                                .iter()
+                                .map(|result| {
+                                    // Convert ToolResultContentBlock to a simple string or JSON value
+                                    let content_value = match &result.content[0] {
+                                        ToolResultContentBlock::Text(text) => serde_json::Value::String(text.clone()),
+                                        ToolResultContentBlock::Json(doc) => {
+                                            // Convert AwsDocument to serde_json::Value using FigDocument
+                                            let fig_doc = FigDocument::from(doc.clone());
+                                            serde_json::to_value(&fig_doc).unwrap_or(serde_json::Value::Null)
+                                        },
+                                    };
+
+                                    gemini_streaming_client::conversion::MockToolResult {
+                                        tool_use_id: result.tool_use_id.clone(),
+                                        content: content_value,
+                                        status: match result.status {
+                                            ToolResultStatus::Success => "success".to_string(),
+                                            ToolResultStatus::Error => "error".to_string(),
+                                        },
+                                    }
+                                })
+                                .collect()
+                        }),
+                };
+
+                // Send request to Gemini API
+                let request = gemini_streaming_client::conversion::conversation_state_to_gemini_request(
+                    &mock_user_message,
+                    &gemini_history,
+                    tools.as_deref(),
+                    client.temperature(),
+                );
+
+                match client.generate_content(request).await {
+                    Ok(response) => {
+                        // Convert Gemini response to a vector of ChatResponseStream events
+                        let mut streams = Vec::new();
+                        if let Some(candidate) = response.candidates.first() {
+                            for part in &candidate.content.parts {
+                                match part {
+                                    gemini_streaming_client::GeminiPart::Text { text } => {
+                                        streams
+                                            .push(ChatResponseStream::AssistantResponseEvent { content: text.clone() });
+                                    },
+                                    gemini_streaming_client::GeminiPart::FunctionCall { function_call } => {
+                                        // Convert function call to tool use event
+                                        let tool_use_id = gemini_streaming_client::conversion::generate_tool_use_id();
+
+                                        // Convert the args to a properly formatted JSON string
+                                        let input = match &function_call.args {
+                                            serde_json::Value::Object(map) => {
+                                                serde_json::to_string(map).unwrap_or_default()
+                                            },
+                                            _ => serde_json::to_string(&function_call.args).unwrap_or_default(),
+                                        };
+
+                                        streams.push(ChatResponseStream::ToolUseEvent {
+                                            tool_use_id: tool_use_id.clone(),
+                                            name: function_call.name.clone(),
+                                            input: None,
+                                            stop: None,
+                                        });
+                                        streams.push(ChatResponseStream::ToolUseEvent {
+                                            tool_use_id,
+                                            name: function_call.name.clone(),
+                                            input: Some(input),
+                                            stop: Some(true),
+                                        });
+                                    },
+                                    gemini_streaming_client::GeminiPart::FunctionResponse { .. } => {},
+                                }
+                            }
+                        }
+                        // Reverse the vector so we can pop from the end
+                        streams.reverse();
+                        Ok(SendMessageOutput::Gemini(streams))
+                    },
+                    Err(e) => {
+                        error!("Gemini API request failed: {}", e);
+                        Err(ApiClientError::ModelRuntimeError(format!(
+                            "Gemini API request failed: {}",
+                            e
+                        )))
+                    },
+                }
+            },
             inner::Inner::Mock(events) => {
                 let mut new_events = events.lock().unwrap().next().unwrap_or_default().clone();
                 new_events.reverse();
@@ -216,6 +451,7 @@ pub enum SendMessageOutput {
         amzn_codewhisperer_streaming_client::operation::generate_assistant_response::GenerateAssistantResponseOutput,
     ),
     QDeveloper(amzn_qdeveloper_streaming_client::operation::send_message::SendMessageOutput),
+    Gemini(Vec<ChatResponseStream>),
     Mock(Vec<ChatResponseStream>),
 }
 
@@ -224,6 +460,7 @@ impl SendMessageOutput {
         match self {
             SendMessageOutput::Codewhisperer(output) => output.request_id(),
             SendMessageOutput::QDeveloper(output) => output.request_id(),
+            SendMessageOutput::Gemini(_) => None, // Gemini doesn't provide a request ID
             SendMessageOutput::Mock(_) => None,
         }
     }
@@ -236,6 +473,7 @@ impl SendMessageOutput {
                 .await?
                 .map(|s| s.into())),
             SendMessageOutput::QDeveloper(output) => Ok(output.send_message_response.recv().await?.map(|s| s.into())),
+            SendMessageOutput::Gemini(vec) => Ok(vec.pop()),
             SendMessageOutput::Mock(vec) => Ok(vec.pop()),
         }
     }
@@ -246,6 +484,7 @@ impl RequestId for SendMessageOutput {
         match self {
             SendMessageOutput::Codewhisperer(output) => output.request_id(),
             SendMessageOutput::QDeveloper(output) => output.request_id(),
+            SendMessageOutput::Gemini(_) => Some("<gemini-request-id>"),
             SendMessageOutput::Mock(_) => Some("<mock-request-id>"),
         }
     }
